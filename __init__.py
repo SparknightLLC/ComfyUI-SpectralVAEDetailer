@@ -18,6 +18,33 @@ except Exception:
 	sampler_helpers = None
 
 # -----------------------------
+# Tuned constants (hardcoded)
+# -----------------------------
+
+# Noise flat suppression (local smoothstep mode)
+_NOISE_SUPPRESS_ENERGY_RADIUS_MULT = 6
+_NOISE_SUPPRESS_LO = 0.20
+_NOISE_SUPPRESS_HI = 0.80
+
+# Anti-splotch: remove residual LF drift from grain
+_NOISE_KILL_LOWFREQ = True
+_NOISE_KILL_LOWFREQ_MULT = 4
+
+# Grain chroma handling (reduce chroma blotches)
+_GRAIN_CHROMA_MODE_SEPARATE = True
+_GRAIN_CHROMA_STRENGTH = 0.35
+
+# Exposure-dependent grain (disabled via constant)
+_GRAIN_EXPOSURE_MAP = False
+_GRAIN_EXPOSURE_RADIUS = 16
+_GRAIN_EXPOSURE_STRENGTH = 0.8
+
+# Adaptive CFG mask thresholds.
+# NOTE: mask energy is per-image normalized => mean ~= 1.0.
+_CFG_ADAPT_LO = 0.75
+_CFG_ADAPT_HI = 1.35
+
+# -----------------------------
 # Helpers / plumbing
 # -----------------------------
 
@@ -125,6 +152,7 @@ def _encode_model_conds_if_possible(base_model, conds, x_in, prompt_type: str):
 
 
 def _lowpass_avgpool(x: torch.Tensor, radius: int) -> torch.Tensor:
+	# NOTE: original behavior intentionally preserved (avg_pool2d with zero padding).
 	r = int(max(0, radius))
 	if r <= 0:
 		return x
@@ -132,13 +160,23 @@ def _lowpass_avgpool(x: torch.Tensor, radius: int) -> torch.Tensor:
 	return F.avg_pool2d(x, kernel_size=k, stride=1, padding=r)
 
 
+def _lowpass_avgpool_reflect(x: torch.Tensor, radius: int) -> torch.Tensor:
+	# Used ONLY for masks/energy maps to avoid border artifacts caused by zero padding.
+	r = int(max(0, radius))
+	if r <= 0:
+		return x
+	k = 2 * r + 1
+	xp = F.pad(x, (r, r, r, r), mode="reflect")
+	return F.avg_pool2d(xp, kernel_size=k, stride=1, padding=0)
+
+
 def _calculate_denoised(base_model, x_in: torch.Tensor, sigma: float, model_out: torch.Tensor) -> torch.Tensor:
 	ms = getattr(base_model, "model_sampling", None)
 	if ms is not None and hasattr(ms, "calculate_denoised"):
-		sig = x_in.new_full((x_in.shape[0], ), float(sigma))
 		try:
 			return ms.calculate_denoised(float(sigma), x_in, model_out)
 		except Exception:
+			sig = x_in.new_full((x_in.shape[0], ), float(sigma))
 			return ms.calculate_denoised(sig, x_in, model_out)
 	# fallback (eps-pred assumption)
 	return x_in - model_out * float(sigma)
@@ -150,8 +188,8 @@ def _randn_like(x: torch.Tensor, seed: int) -> torch.Tensor:
 	try:
 		g = torch.Generator(device=x.device)
 		g.manual_seed(int(seed))
-		return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=g)
-	except TypeError:
+		return torch.randn_like(x, generator=g)
+	except Exception:
 		torch.manual_seed(int(seed))
 		return torch.randn_like(x)
 
@@ -162,25 +200,64 @@ def _resolve_seed(seed: int) -> int:
 	return int(torch.randint(0, 2**31 - 1, (1, )).item())
 
 
-def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _rms_norm_(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 	var = x.pow(2).mean(dim=(2, 3), keepdim=True)
-	return x * torch.rsqrt(var + eps)
+	return x.mul_(torch.rsqrt(var + eps))
 
 
 def _bandpass_grain(noise: torch.Tensor, r: int) -> torch.Tensor:
-	"""
-    Grain size that actually changes:
-      - r=0: white noise
-      - r>0: band-pass correlated noise centered around scale ~r
-    """
 	r = int(max(0, r))
 	if r == 0:
-		return _rms_norm(noise)
-
+		return _rms_norm_(noise)
 	lp1 = _lowpass_avgpool(noise, r)
 	lp2 = _lowpass_avgpool(noise, r * 2)
 	band = lp1 - lp2
-	return _rms_norm(band)
+	return _rms_norm_(band)
+
+
+def _smoothstep01(x: torch.Tensor) -> torch.Tensor:
+	return x * x * (3.0 - 2.0 * x)
+
+
+def _local_energy_map(hp: torch.Tensor, r: int) -> torch.Tensor:
+	# Per-image normalized (mean~=1) energy map, smoothed locally.
+	e = hp.pow(2).mean(dim=1, keepdim=True)
+	if r > 0:
+		e = _lowpass_avgpool_reflect(e, r)
+	e = e / (e.mean(dim=(2, 3), keepdim=True) + 1e-6)
+	return e
+
+
+def _content_detail_mask_from_latent(x: torch.Tensor, r: int) -> torch.Tensor:
+	"""
+	Mask in [0..1] based on *image content* (not model-injected detail).
+	Uses gradient magnitude of the latent structure channel (channel 0) -> local energy -> smoothstep.
+	"""
+	rr = int(max(0, r))
+	l = x[:, :1]
+
+	dx = l[..., 1:] - l[..., :-1]
+	dy = l[..., 1:, :] - l[..., :-1, :]
+
+	dx = F.pad(dx, (0, 1, 0, 0), mode="replicate")
+	dy = F.pad(dy, (0, 0, 0, 1), mode="replicate")
+
+	gm = dx.abs_().add_(dy.abs_())
+
+	e = gm
+	if rr > 0:
+		e = _lowpass_avgpool_reflect(e, rr)
+	e = e / (e.mean(dim=(2, 3), keepdim=True) + 1e-6)
+
+	lo = _CFG_ADAPT_LO
+	hi = _CFG_ADAPT_HI
+	t = torch.clamp((e - lo) / (hi - lo), 0.0, 1.0)
+	return _smoothstep01(t)
+
+
+def _soft_clip_tanh(x: torch.Tensor, k: float) -> torch.Tensor:
+	kk = float(max(1e-6, k))
+	return torch.tanh(x * kk) / kk
 
 
 # -----------------------------
@@ -190,12 +267,13 @@ def _bandpass_grain(noise: torch.Tensor, r: int) -> torch.Tensor:
 
 class SpectralVAEDetailer:
 	"""
-    SpectralVAEDetailer
-    - 1x UNet forward at chosen sigma
-    - Base detail projection from den_pos
-    - Dedicated CFG injection from (den_pos - den_neg)
-    - Latent micrograin injection with true radius + flat suppression
-    """
+	SpectralVAEDetailer
+	- 1x UNet forward at chosen sigma
+	- Base detail projection from den_pos
+	- Dedicated CFG injection from (den_pos - den_neg)
+	- Optional adaptive CFG split (flat vs detailed) to avoid background splotchiness
+	- Latent micrograin injection with local flat suppression + optional LF cleanup
+	"""
 
 	def __init__(self):
 		self._conv_cache = {}
@@ -210,7 +288,8 @@ class SpectralVAEDetailer:
 		            "default": -1,
 		            "min": -1,
 		            "max": 2**31 - 1,
-		            "step": 1
+		            "step": 1,
+		            "tooltip": "Random seed for grain. Use -1 for random each run."
 		        }),
 
 		        # --- Main inputs
@@ -219,96 +298,165 @@ class SpectralVAEDetailer:
 		        "positive": ("CONDITIONING", ),
 		        "negative": ("CONDITIONING", ),
 
-		        # --- CFG group (final defaults)
+		        # --- CFG group
 		        "cfg": ("FLOAT", {
 		            "default": 7.0,
 		            "min": 0.0,
 		            "max": 10.0,
-		            "step": 0.05
+		            "step": 0.05,
+		            "tooltip": "Base CFG. This node applies additional HF/LF shaping when cfg > 1."
 		        }),
 		        "cfg_hf_boost": ("FLOAT", {
 		            "default": 5.0,
 		            "min": 0.0,
 		            "max": 5.0,
-		            "step": 0.05
+		            "step": 0.05,
+		            "tooltip": "How strongly to inject high-frequency CFG detail (from den_pos - den_neg)."
 		        }),
 		        "cfg_lf_boost": ("FLOAT", {
 		            "default": 0.0,
 		            "min": 0.0,
 		            "max": 2.0,
-		            "step": 0.02
+		            "step": 0.02,
+		            "tooltip": "How strongly to inject low-frequency CFG contrast (usually keep low)."
 		        }),
 		        "cfg_radius": ("INT", {
 		            "default": 5,
 		            "min": 0,
 		            "max": 64,
-		            "step": 1
+		            "step": 1,
+		            "tooltip": "CFG split radius. In adaptive mode, this is the DETAIL radius."
+		        }),
+		        "cfg_radius_flat": ("INT", {
+		            "default": 0,
+		            "min": 0,
+		            "max": 64,
+		            "step": 1,
+		            "tooltip": "CFG split radius used in flat/low-detail regions when adaptive mode is ON."
+		        }),
+		        "cfg_radius_adaptive": ("BOOLEAN", {
+		            "default": True,
+		            "tooltip": "If ON, blends between cfg_radius_flat (flat) and cfg_radius (detail)."
+		        }),
+		        # NEW: adaptive mask smoothing controls
+		        "cfg_adapt_feather": ("INT", {
+		            "default": 2,
+		            "min": 0,
+		            "max": 32,
+		            "step": 1,
+		            "tooltip": "Blur radius applied to the adaptive mask. Higher reduces halos but can soften detail reach."
+		        }),
+		        "cfg_adapt_gamma": ("FLOAT", {
+		            "default": 2.0,
+		            "min": 0.5,
+		            "max": 3.0,
+		            "step": 0.05,
+		            "tooltip": "Mask curve. >1 shrinks 'detailed' regions (less spill/halo). <1 expands them."
 		        }),
 
-		        # --- Core look (final defaults)
+		        # --- Core look
 		        "sigma": ("FLOAT", {
 		            "default": 0.4,
 		            "min": 0.001,
 		            "max": 50.0,
-		            "step": 0.001
+		            "step": 0.001,
+		            "tooltip": "Sigma at which to run the single UNet forward for detail projection."
 		        }),
 		        "detail_strength": ("FLOAT", {
 		            "default": 0.65,
 		            "min": 0.0,
 		            "max": 2.0,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Strength of injected high-frequency detail from denoised estimate."
 		        }),
 		        "hf_radius": ("INT", {
-		            "default": 8,
+		            "default": 4,
 		            "min": 0,
 		            "max": 64,
-		            "step": 1
+		            "step": 1,
+		            "tooltip": "Detail split radius for base projection (larger = coarser separation)."
 		        }),
 		        "mid_strength": ("FLOAT", {
 		            "default": 0.05,
 		            "min": 0.0,
 		            "max": 0.5,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Adds some mid/low component of the base projection (contrast/shape)."
 		        }),
 		        "chroma_strength": ("FLOAT", {
 		            "default": 0.1,
 		            "min": 0.0,
 		            "max": 2.0,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Scales chroma channels (1..3) for detail/CFG injections. Grain chroma is limited internally."
 		        }),
 		        "protect_lows": ("FLOAT", {
 		            "default": 0.9,
 		            "min": 0.0,
 		            "max": 1.0,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Prevents HF detail from over-applying in low-frequency regions (reduces harshness)."
 		        }),
 
-		        # --- Grain (final defaults)
+		        # --- Detail soft-clip
+		        "soft_clip_detail": ("BOOLEAN", {
+		            "default": False,
+		            "tooltip": "Soft-limits HF detail to reduce halos/zipper edges."
+		        }),
+		        "soft_clip_detail_k": ("FLOAT", {
+		            "default": 2.2,
+		            "min": 0.5,
+		            "max": 8.0,
+		            "step": 0.05,
+		            "tooltip": "Detail soft-clip amount. Higher = weaker limiting."
+		        }),
+		        "soft_clip_cfg": ("BOOLEAN", {
+		            "default": True,
+		            "tooltip": "Soft-limits HF CFG injection to reduce harsh edges and background speckle."
+		        }),
+		        "soft_clip_cfg_k": ("FLOAT", {
+		            "default": 2.0,
+		            "min": 0.5,
+		            "max": 8.0,
+		            "step": 0.05,
+		            "tooltip": "CFG soft-clip amount. Higher = weaker limiting."
+		        }),
+
+		        # --- Grain
 		        "noise_scale": ("FLOAT", {
 		            "default": 0.2,
 		            "min": 0.0,
 		            "max": 0.5,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Micrograin intensity in latent space."
 		        }),
 		        "noise_radius": ("INT", {
 		            "default": 1,
 		            "min": 0,
 		            "max": 16,
-		            "step": 1
+		            "step": 1,
+		            "tooltip": "Grain correlation radius. 0=white, 1..3 often looks most photographic."
 		        }),
 		        "noise_flat_suppress": ("FLOAT", {
-		            "default": 0.0,
+		            "default": 1.0,
 		            "min": 0.0,
 		            "max": 1.0,
-		            "step": 0.01
+		            "step": 0.01,
+		            "tooltip": "Suppresses grain in flat regions (stronger in local smoothstep mode)."
+		        }),
+		        "noise_suppress_mode": (["global", "local_smoothstep"], {
+		            "default": "local_smoothstep",
+		            "tooltip": "global = older behavior. local_smoothstep = per-pixel local contrast gating (recommended)."
 		        }),
 
-		        # --- Toggles at bottom
+		        # --- Bottom toggles
 		        "ignore_cond_timestep_range": ("BOOLEAN", {
-		            "default": True
+		            "default": True,
+		            "tooltip": "If ON, strips timestep limits from conditioning ranges (more consistent behavior)."
 		        }),
 		        "debug_print": ("BOOLEAN", {
-		            "default": False
+		            "default": False,
+		            "tooltip": "Prints some diagnostics to console."
 		        }),
 		    }
 		}
@@ -373,15 +521,24 @@ class SpectralVAEDetailer:
 	    cfg_hf_boost: float,
 	    cfg_lf_boost: float,
 	    cfg_radius: int,
+	    cfg_radius_flat: int,
+	    cfg_radius_adaptive: bool,
+	    cfg_adapt_feather: int,
+	    cfg_adapt_gamma: float,
 	    sigma: float,
 	    detail_strength: float,
 	    hf_radius: int,
 	    mid_strength: float,
 	    chroma_strength: float,
 	    protect_lows: float,
+	    soft_clip_detail: bool,
+	    soft_clip_detail_k: float,
+	    soft_clip_cfg: bool,
+	    soft_clip_cfg_k: float,
 	    noise_scale: float,
 	    noise_radius: int,
 	    noise_flat_suppress: float,
+	    noise_suppress_mode: str,
 	    ignore_cond_timestep_range: bool,
 	    debug_print: bool,
 	):
@@ -396,14 +553,12 @@ class SpectralVAEDetailer:
 
 		model_dev, model_dtype = _get_model_device_dtype(model, orig_dev, orig_dtype)
 
-		x = x_orig.to(device=model_dev)
-		if torch.is_floating_point(x) and x.dtype != model_dtype:
-			x = x.to(dtype=model_dtype)
+		x_in = x_orig.to(device=model_dev)
+		if torch.is_floating_point(x_in) and x_in.dtype != model_dtype:
+			x_in = x_in.to(dtype=model_dtype)
 
 		sig = float(max(1e-6, sigma))
 		used_seed = _resolve_seed(int(seed))
-
-		x_in = x
 
 		with _patcher_ctx(model):
 			base_model, out_pos, out_neg = self._cond_uncond_outs(model, x_in, sig, positive, negative, bool(ignore_cond_timestep_range))
@@ -413,41 +568,89 @@ class SpectralVAEDetailer:
 
 		# Base detail projection uses den_pos
 		base_delta = den_pos - x_in
-
 		base_low = _lowpass_avgpool(base_delta, int(hf_radius))
 		base_hp = base_delta - base_low
 
+		# Protect low-frequency regions from HF over-application
 		pl = float(max(0.0, min(1.0, protect_lows)))
 		if pl > 0.0:
-			hp_e = base_hp.abs().mean(dim=1, keepdim=True) + 1e-6
-			d_e = base_delta.abs().mean(dim=1, keepdim=True) + 1e-6
+			hp_e = base_hp.abs().mean(dim=1, keepdim=True).add_(1e-6)
+			d_e = base_delta.abs().mean(dim=1, keepdim=True).add_(1e-6)
 			gate = hp_e / (hp_e + d_e)
-			base_hp = base_hp * gate.lerp(torch.ones_like(gate), 1.0 - pl)
+			factor = gate.mul(pl).add_(1.0 - pl)  # (1-pl) + pl*gate
+			base_hp.mul_(factor)
 
+		# Optional soft clip to reduce halos / zipper edges
+		if bool(soft_clip_detail):
+			base_hp = _soft_clip_tanh(base_hp, float(soft_clip_detail_k))
+
+		# Chroma scaling for detail (in-place)
 		cs = float(chroma_strength)
 		if base_hp.shape[1] >= 4 and cs != 1.0:
-			hp_struct = base_hp[:, :1]
-			hp_other = base_hp[:, 1:4] * cs
-			base_hp = torch.cat([hp_struct, hp_other], dim=1)
+			base_hp[:, 1:4].mul_(cs)
 
-		out = x + base_hp * float(detail_strength) + base_low * float(max(0.0, mid_strength))
+		# Build output (in-place accumulation)
+		out = x_in.clone()
 
-		# Dedicated CFG injection (visible)
+		ds = float(detail_strength)
+		if ds != 0.0:
+			out.add_(base_hp, alpha=ds)
+
+		ms = float(max(0.0, mid_strength))
+		if ms != 0.0:
+			out.add_(base_low, alpha=ms)
+
+		# Dedicated CFG injection
 		c = float(cfg)
 		cfg_scale = max(0.0, c - 1.0)
 		if cfg_scale > 0.0 and (cfg_hf_boost > 0.0 or cfg_lf_boost > 0.0):
-			cfg_delta = (den_pos - den_neg)
-			cfg_low = _lowpass_avgpool(cfg_delta, int(cfg_radius))
-			cfg_hp = cfg_delta - cfg_low
+			cfg_delta = den_pos - den_neg
 
+			if bool(cfg_radius_adaptive):
+				r_flat = int(max(0, cfg_radius_flat))
+				r_det = int(max(0, cfg_radius))  # cfg_radius is detail radius
+
+				# Content-derived mask (0..1)
+				mask_r = max(1, int(hf_radius))
+				m = _content_detail_mask_from_latent(x_in, mask_r)  # (B,1,H,W)
+
+				# Feather the mask to prevent boundary halos/bloom
+				fr = int(max(0, cfg_adapt_feather))
+				if fr > 0:
+					m = _lowpass_avgpool_reflect(m, fr)
+
+				# Curve the mask: gamma > 1 reduces spill into flat regions
+				gam = float(max(1e-3, cfg_adapt_gamma))
+				if abs(gam - 1.0) > 1e-6:
+					m = m.clamp(0.0, 1.0).pow(gam)
+
+				m = m.clamp(0.0, 1.0)
+
+				low_flat = _lowpass_avgpool(cfg_delta, r_flat)
+				low_det = _lowpass_avgpool(cfg_delta, r_det)
+
+				# Blend low, then derive hp from blended low (numerically consistent)
+				cfg_low = low_flat.mul(1.0 - m).add_(low_det.mul(m))
+				cfg_hp = cfg_delta - cfg_low
+			else:
+				cfg_low = _lowpass_avgpool(cfg_delta, int(cfg_radius))
+				cfg_hp = cfg_delta - cfg_low
+
+			if bool(soft_clip_cfg):
+				cfg_hp = _soft_clip_tanh(cfg_hp, float(soft_clip_cfg_k))
+
+			# Chroma scaling for CFG injections (in-place)
 			if cfg_hp.shape[1] >= 4 and cs != 1.0:
-				hp_struct = cfg_hp[:, :1]
-				hp_other = cfg_hp[:, 1:4] * cs
-				cfg_hp = torch.cat([hp_struct, hp_other], dim=1)
+				cfg_hp[:, 1:4].mul_(cs)
 
-			out = out + cfg_hp * float(cfg_hf_boost) * cfg_scale + cfg_low * float(cfg_lf_boost) * cfg_scale
+			hf_a = float(cfg_hf_boost) * cfg_scale
+			lf_a = float(cfg_lf_boost) * cfg_scale
+			if hf_a != 0.0:
+				out.add_(cfg_hp, alpha=hf_a)
+			if lf_a != 0.0:
+				out.add_(cfg_low, alpha=lf_a)
 
-		# Micrograin (visible radius + meaningful flat suppression)
+		# Micrograin
 		ns = float(max(0.0, noise_scale))
 		if ns > 0.0:
 			n = _randn_like(out, used_seed)
@@ -455,18 +658,38 @@ class SpectralVAEDetailer:
 
 			fs = float(max(0.0, min(1.0, noise_flat_suppress)))
 			if fs > 0.0:
-				e = base_hp.abs().mean(dim=1, keepdim=True)
-				e = e / (e.mean() + 1e-6)
-				allow = torch.clamp(e, 0.0, 1.0).pow(2.0)
-				allow = (1.0 - fs) + fs * allow
-				g = g * allow
+				mode = str(noise_suppress_mode)
+				if mode == "global":
+					e = base_hp.abs().mean(dim=1, keepdim=True)
+					e = e / (e.mean() + 1e-6)
+					allow = torch.clamp(e, 0.0, 1.0).pow(2.0)
+					allow = (1.0 - fs) + fs * allow
+					g = g * allow
+				else:
+					er = max(1, int(noise_radius) * _NOISE_SUPPRESS_ENERGY_RADIUS_MULT)
+					e = _local_energy_map(base_hp, er)
+					t = torch.clamp((e - _NOISE_SUPPRESS_LO) / (_NOISE_SUPPRESS_HI - _NOISE_SUPPRESS_LO), 0.0, 1.0)
+					allow = _smoothstep01(t)
+					allow = (1.0 - fs) + fs * allow
+					g = g * allow
 
-			if g.shape[1] >= 4 and cs != 1.0:
-				g_struct = g[:, :1]
-				g_other = g[:, 1:4] * cs
-				g = torch.cat([g_struct, g_other], dim=1)
+			if _NOISE_KILL_LOWFREQ and int(noise_radius) > 0:
+				rr = int(noise_radius) * _NOISE_KILL_LOWFREQ_MULT
+				g = g - _lowpass_avgpool(g, rr)
 
-			out = out + g * ns
+			if _GRAIN_EXPOSURE_MAP:
+				r = int(max(0, _GRAIN_EXPOSURE_RADIUS))
+				lum = den_pos[:, :1]
+				if r > 0:
+					lum = _lowpass_avgpool(lum, r)
+				lum = (lum - lum.mean(dim=(2, 3), keepdim=True)) / (lum.std(dim=(2, 3), keepdim=True) + 1e-6)
+				grain_map = torch.sigmoid(-float(_GRAIN_EXPOSURE_STRENGTH) * lum)
+				g = g * grain_map
+
+			if g.shape[1] >= 4 and _GRAIN_CHROMA_MODE_SEPARATE:
+				g[:, 1:4].mul_(float(_GRAIN_CHROMA_STRENGTH))
+
+			out.add_(g, alpha=ns)
 
 		if debug_print:
 			d_unet = (out_pos - out_neg).abs().mean().item()
@@ -474,6 +697,7 @@ class SpectralVAEDetailer:
 			print(f"[SpectralVAEDetailer] used_seed={used_seed} cfg={c:.3f} sigma={sig:.4f} noise_scale={ns:.3f} "
 			      f"| mean|pos-neg|={d_unet:.6g} mean|den_pos-den_neg|={d_den:.6g}")
 
+		# Move back to original device/dtype
 		out = out.to(device=orig_dev)
 		if torch.is_floating_point(out) and out.dtype != orig_dtype:
 			out = out.to(dtype=orig_dtype)
